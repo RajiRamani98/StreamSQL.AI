@@ -61,9 +61,15 @@ DeepSeek-V3 can be deployed locally using the following open-source community so
 
 1. **Streamlit**: To design lightweight web application, streamlit needs to be installed.
 2. **GenerativeAI**: To generate queries based on provided prompts, we need Google LLM model Generative AI.
+### To generate Google API key:
+    ```shell
+    Go to Google AI Studio.
+    Log in with your Google account.
+    Create an API key and store it in .env file and import the file into your Python IDE.
+    ```
 2. **dotenv**: Python dotenv is a powerful tool that makes it easy to handle environment variables in Python applications from start to finish.
 
-Below are the commands used for install 
+Below are the commands used for installation of Streamlit, GenerativeAI and dotenv:
 ```shell
 pip install -r requirements.txt
 ```
