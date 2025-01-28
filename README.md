@@ -63,7 +63,7 @@ DeepSeek-V3 can be deployed locally using the following open-source community so
 2. **GenerativeAI**: To generate queries based on provided prompts, we need Google LLM model Generative AI.
 ### To generate Google API key:
     
-    Go to [Google AI Studio](https://aistudio.google.com).
+    Go to Google AI Studio.
     Log in with your Google account.
     Create an API key and store it in .env file and import the file into your Python IDE.
    
