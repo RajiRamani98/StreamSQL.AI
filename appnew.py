@@ -5,51 +5,90 @@ import os
 import sqlite3
 import google.genai as genai
 from google.genai import types
+from prompts import SYSTEM_SQL_PROMPT, SYSTEM_OUTPUT_PROMPT
 
 # Load .env from the app directory explicitly
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
-# Configure Gemini API key
-api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-if api_key:
-    api_key = api_key.strip().strip('"').strip("'")
-if not api_key:
-    raise RuntimeError("Missing Google Generative AI API key. Set GOOGLE_API_KEY or GEMINI_API_KEY in .env")
 
-# Use Google GenAI client with API key
-client = genai.Client(api_key=api_key)
-MODEL_NAME = "gemini-flash-latest"
+def get_client():
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if api_key:
+        api_key = api_key.strip().strip('"').strip("'")
+    if not api_key:
+        raise RuntimeError("Missing Google Generative AI API key. Set GOOGLE_API_KEY or GEMINI_API_KEY in .env")
+    return genai.Client(api_key=api_key)
 
-SYSTEM_SQL_PROMPT = """
-You are a SQL generation assistant. Use the SQLite schema below to generate exactly one valid SQL statement.
-The database has these tables and columns:
-CUSTOMERS(ORDER_ID, ORDER_TMS, CUSTOMER_ID, ORDER_STATUS, STORE_ID)
-ORDER_ITEMS(ORDER_ID, LINE_ITEM_ID, PRODUCT_ID, UNIT_PRICE, QUANTITY, SHIPMENT_ID)
-SHIPMENTS(SHIPMENT_ID, STORE_ID, CUSTOMER_ID, DELIVERY_ADDRESS, SHIPMENT_STATUS)
-USER_TABLES(DB_NAME, TABLE_NAME, COLUMN_NAME)
-USER_INDEXES(INDEX_ID, INDEX_NAME, TABLE_NAME, COLUMN_NAME)
-STATS(DB_NAME, TABLE_NAME, DB_SIZE, TABLE_SIZE)
 
-Rules:
-- Output only a single valid SQL statement.
-- Do not add explanation, markdown, comments, or code fences.
-- Use single quotes for string values.
-- Use SELECT for read queries.
-- Use INSERT, UPDATE, DELETE for write queries.
-- Use the exact values from the user's request; do not invent or replace numbers.
-- When the user says "update <table> from <old> to <new>", translate that to an UPDATE with the same primary key column set to <new> and a WHERE clause matching <old>.
-- For SHIPMENTS, if the request is to update shipment id values, generate `UPDATE SHIPMENTS SET SHIPMENT_ID = <new> WHERE SHIPMENT_ID = <old>`.
-- If the user asks for orders or order data, prefer CUSTOMERS.
-- If the user asks for shipment details, prefer SHIPMENTS.
-- If the user asks for item-level details, prefer ORDER_ITEMS.
-- If unsure, return the best fitting query using the schema.
-"""
+try:
+    client = get_client()
+except Exception as exc:
+    client = None
+    CLIENT_INIT_ERROR = exc
+else:
+    CLIENT_INIT_ERROR = None
 
-SYSTEM_OUTPUT_PROMPT = """
-You are an expert assistant that converts SQL results into a short, human-readable summary.
-Return only the summary without extra formatting.
-"""
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+FALLBACK_MODEL_NAME = "gemini-2.0-flash"
+
+
+def infer_target_table(question):
+    normalized = (question or "").lower()
+
+    shipment_terms = [
+        "shipment", "shipments", "delivery", "deliver", "dispatch",
+        "tracking", "track", "shipment_status", "shipment id", "shipment_id",
+        "shipping"
+    ]
+    item_terms = [
+        "line item", "line_item", "line-item", "item", "items",
+        "product", "products", "quantity", "unit price", "price", "sku"
+    ]
+    order_terms = ["order", "customer", "customer_id", "order_status", "store", "order_tms"]
+    metadata_size_terms = ["db size", "table size", "database size", "storage", "size", "db_size", "table_size"]
+    metadata_index_terms = ["index", "indexes", "indexed", "indexes created", "index metadata"]
+    metadata_table_terms = ["table metadata", "table schema", "table structure", "columns", "column", "metadata", "schema"]
+
+    if any(term in normalized for term in metadata_size_terms):
+        return "STATS"
+    if any(term in normalized for term in metadata_index_terms):
+        return "USER_INDEXES"
+    if any(term in normalized for term in metadata_table_terms):
+        return "USER_TABLES"
+    if any(term in normalized for term in shipment_terms):
+        return "SHIPMENTS"
+    if any(term in normalized for term in item_terms):
+        return "ORDER_ITEMS"
+    if any(term in normalized for term in order_terms):
+        return "CUSTOMERS"
+    return None
+
+
+def build_sql_prompt(question):
+    target_table = infer_target_table(question)
+    if not target_table:
+        return question
+
+    if target_table == "SHIPMENTS":
+        return (
+            f"IMPORTANT: This request is about shipment information. "
+            f"Use SHIPMENTS as the primary table. Do not use ORDER_ITEMS for shipment, delivery, or tracking questions.\n"
+            f"User request: {question}"
+        )
+
+    if target_table == "ORDER_ITEMS":
+        return (
+            f"IMPORTANT: This request is about item-level details. "
+            f"Use ORDER_ITEMS as the primary table.\n"
+            f"User request: {question}"
+        )
+
+    return (
+        f"IMPORTANT: This request is about order/customer information. "
+        f"Use CUSTOMERS as the primary table.\n"
+        f"User request: {question}"
+    )
 
 
 def extract_sql_from_text(text):
@@ -77,33 +116,54 @@ def extract_sql_from_text(text):
 
 # function to load gemini model and generate SQL query as response
 def get_gemini_res(question):
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=[
-            types.Part.from_text(text=SYSTEM_SQL_PROMPT),
-            types.Part.from_text(text=question),
-        ],
-        config=types.GenerateContentConfig(
-            max_output_tokens=512,
-            temperature=0.15,
-        ),
-    )
-    return extract_sql_from_text(response.text)
+    client_instance = get_client()
+    enhanced_question = build_sql_prompt(question)
+
+    for model_name in [MODEL_NAME, FALLBACK_MODEL_NAME]:
+        try:
+            response = client_instance.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_text(text=SYSTEM_SQL_PROMPT),
+                    types.Part.from_text(text=enhanced_question),
+                ],
+                config=types.GenerateContentConfig(
+                    max_output_tokens=512,
+                    temperature=0.15,
+                ),
+            )
+            return extract_sql_from_text(response.text)
+        except Exception as exc:
+            if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc) or "quota" in str(exc).lower():
+                continue
+            raise
+
+    raise RuntimeError("The AI service is currently unavailable due to quota limits. Please try again shortly.")
 
 #function to convert output into human readable format
 def gen_gemini_finaloutput(question):
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=[
-            types.Part.from_text(text=SYSTEM_OUTPUT_PROMPT),
-            types.Part.from_text(text=question),
-        ],
-        config=types.GenerateContentConfig(
-            max_output_tokens=256,
-            temperature=0.15,
-        ),
-    )
-    return response.text.strip()
+    client_instance = get_client()
+
+    for model_name in [MODEL_NAME, FALLBACK_MODEL_NAME]:
+        try:
+            response = client_instance.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_text(text=SYSTEM_OUTPUT_PROMPT),
+                    types.Part.from_text(text=question),
+                ],
+                config=types.GenerateContentConfig(
+                    max_output_tokens=256,
+                    temperature=0.15,
+                ),
+            )
+            return response.text.strip()
+        except Exception as exc:
+            if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc) or "quota" in str(exc).lower():
+                continue
+            raise
+
+    raise RuntimeError("The AI service is currently unavailable due to quota limits. Please try again shortly.")
 
 
 def is_sql_query(text):
@@ -126,9 +186,15 @@ def clean_summary_text(text):
     if not text:
         return ""
 
+    text = text.replace("\r\n", "\n")
     text = re.sub(r'```(?:sql)?\s*.*?\s*```', '', text, flags=re.S | re.I)
     text = re.sub(r'###\s*', '', text)
     text = re.sub(r'\[([^\]]*)\]\(([^)]+)\)', r'\1', text)
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.*?)\*', r'\1', text)
+    text = re.sub(r'`([^`]*)`', r'\1', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 #Db connection for fetching Data

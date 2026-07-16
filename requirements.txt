@@ -1,3 +1,4 @@
 python-dotenv
 streamlit
 google-genai
+pytest
